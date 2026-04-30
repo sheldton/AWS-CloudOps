@@ -1,0 +1,244 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Cloud Operations on AWS - Capstone Lab.
+  Deploys Example Corp.'s sample web application: a public ALB in 2 Availability Zones
+  fronting an Auto Scaling Group of Amazon Linux 2023 instances running Apache httpd.
+  Cost-optimized for a classroom demo (t3.micro, public subnets only, no NAT gateway).
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: example-corp-web
+    Description: Tag value used to identify all lab resources.
+  EnvironmentType:
+    Type: String
+    Default: Lab
+    AllowedValues: [Lab, Development, Production]
+  InstanceType:
+    Type: String
+    Default: t3.micro
+    AllowedValues: [t3.micro, t3.small, t3.medium]
+  LatestAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+    Description: Resolved at deploy time from Systems Manager Parameter Store.
+
+Mappings: {}
+
+Resources:
+
+  # ---------------- Network (Module 11) ----------------
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.20.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - { Key: Name, Value: !Sub "${ProjectName}-vpc" }
+        - { Key: example-corp:environment-type, Value: !Ref EnvironmentType }
+        - { Key: example-corp:owner, Value: cloudops-team }
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - { Key: Name, Value: !Sub "${ProjectName}-igw" }
+
+  IgwAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref Vpc
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.20.1.0/24
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - { Key: Name, Value: !Sub "${ProjectName}-public-a" }
+
+  PublicSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.20.2.0/24
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - { Key: Name, Value: !Sub "${ProjectName}-public-b" }
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags:
+        - { Key: Name, Value: !Sub "${ProjectName}-public-rt" }
+
+  DefaultPublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: IgwAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  AssocSubnetA:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref PublicSubnetA, RouteTableId: !Ref PublicRouteTable }
+  AssocSubnetB:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref PublicSubnetB, RouteTableId: !Ref PublicRouteTable }
+
+  # ---------------- Security Groups (Module 11) ----------------
+  AlbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow HTTP from the internet to the ALB
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+          Description: HTTP from anywhere
+      Tags:
+        - { Key: Name, Value: !Sub "${ProjectName}-alb-sg" }
+
+  AppSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow HTTP only from the ALB security group
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          SourceSecurityGroupId: !Ref AlbSecurityGroup
+          Description: HTTP from the ALB
+      Tags:
+        - { Key: Name, Value: !Sub "${ProjectName}-app-sg" }
+
+  # ---------------- IAM (Module 2 / 6) ----------------
+  Ec2InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ec2.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+        - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
+      Tags:
+        - { Key: Name, Value: !Sub "${ProjectName}-ec2-role" }
+
+  Ec2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles: [!Ref Ec2InstanceRole]
+
+  # ---------------- Compute: Launch Template + ASG (Modules 4, 5, 8) ----------------
+  AppLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Sub "${ProjectName}-lt"
+      LaunchTemplateData:
+        ImageId: !Ref LatestAmiId
+        InstanceType: !Ref InstanceType
+        IamInstanceProfile: { Arn: !GetAtt Ec2InstanceProfile.Arn }
+        SecurityGroupIds: [!Ref AppSecurityGroup]
+        MetadataOptions: { HttpTokens: required }
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - { Key: Name, Value: !Sub "${ProjectName}-app" }
+              - { Key: example-corp:owner, Value: cloudops-team }
+              - { Key: example-corp:environment-type, Value: !Ref EnvironmentType }
+              - { Key: example-corp:cost-center, Value: "78214" }
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            dnf -y update
+            dnf -y install httpd stress-ng
+            systemctl enable --now httpd
+            TOKEN=$(curl -s -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 60")
+            AZ=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/placement/availability-zone)
+            ID=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/instance-id)
+            cat > /var/www/html/index.html <<HTML
+            <!doctype html><html><head><title>Example Corp. Web</title>
+            <style>body{font-family:Arial;background:#0f172a;color:#f1f5f9;text-align:center;padding:50px}
+            h1{color:#38bdf8}.box{background:#1e293b;padding:30px;border-radius:8px;display:inline-block}</style></head>
+            <body><div class="box"><h1>Example Corp. Web Application</h1>
+            <p>Served by instance <b>$ID</b></p><p>Availability Zone: <b>$AZ</b></p>
+            <p>Module: Cloud Operations Capstone Lab</p></div></body></html>
+            HTML
+
+  ApplicationLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub "${ProjectName}-alb"
+      Scheme: internet-facing
+      Type: application
+      SecurityGroups: [!Ref AlbSecurityGroup]
+      Subnets: [!Ref PublicSubnetA, !Ref PublicSubnetB]
+      Tags:
+        - { Key: Name, Value: !Sub "${ProjectName}-alb" }
+        - { Key: example-corp:environment-type, Value: !Ref EnvironmentType }
+
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub "${ProjectName}-tg"
+      VpcId: !Ref Vpc
+      Protocol: HTTP
+      Port: 80
+      TargetType: instance
+      HealthCheckPath: /
+      HealthCheckIntervalSeconds: 15
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+
+  HttpListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref ApplicationLoadBalancer
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref TargetGroup
+
+  AutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      AutoScalingGroupName: !Sub "${ProjectName}-asg"
+      VPCZoneIdentifier: [!Ref PublicSubnetA, !Ref PublicSubnetB]
+      LaunchTemplate:
+        LaunchTemplateId: !Ref AppLaunchTemplate
+        Version: !GetAtt AppLaunchTemplate.LatestVersionNumber
+      MinSize: "2"
+      MaxSize: "4"
+      DesiredCapacity: "2"
+      HealthCheckType: ELB
+      HealthCheckGracePeriod: 60
+      TargetGroupARNs: [!Ref TargetGroup]
+      Tags:
+        - { Key: Name, Value: !Sub "${ProjectName}-app", PropagateAtLaunch: true }
+        - { Key: example-corp:owner, Value: cloudops-team, PropagateAtLaunch: true }
+
+Outputs:
+  WebsiteURL:
+    Description: Public URL of the Example Corp. web application
+    Value: !Sub "http://${ApplicationLoadBalancer.DNSName}"
+  VpcId:
+    Value: !Ref Vpc
+  AsgName:
+    Value: !Ref AutoScalingGroup
+  TargetGroupArn:
+    Value: !Ref TargetGroup
